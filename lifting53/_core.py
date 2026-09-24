@@ -343,6 +343,57 @@ def max_levels(height: int, width: int) -> int:
     return count
 
 
+def _check_levels(h: int, w: int, levels: int) -> None:
+    """Validate the level count against the shape (shared by dwt2d/codec)."""
+    limit = max_levels(h, w)
+    if levels > limit:
+        # A 1x1 image (limit == 0) accepts exactly one level, which is the
+        # documented length-1 identity; anything beyond it is rejected.
+        if not (limit == 0 and levels == 1):
+            raise ValueError(
+                f"levels={levels} exceeds max_levels({h}, {w})={limit}; "
+                f"further levels would be identity on a 1x1 LL block"
+            )
+
+
+def _build_layouts(h: int, w: int, levels: int) -> tuple[LevelLayout, ...]:
+    """Deterministically derive every level layout from shape + level count.
+
+    The bitstream codec stores only shape and levels; the decoder rebuilds
+    layouts with this same function.
+    """
+    layouts: list[LevelLayout] = []
+    r0 = c0 = 0
+    r1, c1 = h, w
+    for level in range(1, levels + 1):
+        lr = (r1 - r0 + 1) // 2
+        lc = (c1 - c0 + 1) // 2
+        bands = (
+            Subband("LL", level, (r0, r0 + lr), (c0, c0 + lc)),
+            Subband("LH", level, (r0, r0 + lr), (c0 + lc, c1)),
+            Subband("HL", level, (r0 + lr, r1), (c0, c0 + lc)),
+            Subband("HH", level, (r0 + lr, r1), (c0 + lc, c1)),
+        )
+        layouts.append(
+            LevelLayout(level, (r0, r1), (c0, c1), lr, lc, bands)
+        )
+        # Multi-level: recurse into the LL region only.
+        r1 = r0 + lr
+        c1 = c0 + lc
+    return tuple(layouts)
+
+
+def _aggregate_subbands(
+    layouts: tuple[LevelLayout, ...], levels: int
+) -> tuple[Subband, ...]:
+    return tuple(
+        b
+        for layout in layouts
+        for b in layout.bands
+        if not (b.name == "LL" and layout.level < levels)
+    )
+
+
 def dwt2d(image: Sequence[Sequence[int]], levels: int = 1) -> TransformResult:
     """Forward 2D reversible 5/3 lifting decomposition.
 
@@ -359,44 +410,16 @@ def dwt2d(image: Sequence[Sequence[int]], levels: int = 1) -> TransformResult:
             f"{MAX_SIDE}x{MAX_SIDE}"
         )
 
-    limit = max_levels(h, w)
-    if levels > limit:
-        # A 1x1 image (limit == 0) accepts exactly one level, which is the
-        # documented length-1 identity; anything beyond it is rejected.
-        if not (limit == 0 and levels == 1):
-            raise ValueError(
-                f"levels={levels} exceeds max_levels({h}, {w})={limit}; "
-                f"further levels would be identity on a 1x1 LL block"
-            )
+    _check_levels(h, w, levels)
 
-    layouts: list[LevelLayout] = []
-    r0 = c0 = 0
-    r1, c1 = h, w
-    for level in range(1, levels + 1):
-        _fwd_block(a, r0, r1, c0, c1)
-        lr = (r1 - r0 + 1) // 2
-        lc = (c1 - c0 + 1) // 2
-        bands = (
-            Subband("LL", level, (r0, r0 + lr), (c0, c0 + lc)),
-            Subband("LH", level, (r0, r0 + lr), (c0 + lc, c1)),
-            Subband("HL", level, (r0 + lr, r1), (c0, c0 + lc)),
-            Subband("HH", level, (r0 + lr, r1), (c0 + lc, c1)),
-        )
-        layouts.append(
-            LevelLayout(level, (r0, r1), (c0, c1), lr, lc, bands)
-        )
-        # Multi-level: recurse into the LL region only.
-        r1 = r0 + lr
-        c1 = c0 + lc
+    layouts = _build_layouts(h, w, levels)
+    for layout in layouts:
+        _fwd_block(a, layout.rows[0], layout.rows[1],
+                   layout.cols[0], layout.cols[1])
 
-    aggregate = tuple(
-        b
-        for layout in layouts
-        for b in layout.bands
-        if not (b.name == "LL" and layout.level < levels)
-    )
+    aggregate = _aggregate_subbands(layouts, levels)
     coeffs = tuple(tuple(row) for row in a)
-    return TransformResult(coeffs, (h, w), levels, tuple(layouts), aggregate)
+    return TransformResult(coeffs, (h, w), levels, layouts, aggregate)
 
 
 def _validate_result(result: object) -> TransformResult:
@@ -406,20 +429,33 @@ def _validate_result(result: object) -> TransformResult:
             f"(got {type(result).__name__})"
         )
     h, w = result.shape
+    levels = result.levels
     if (not isinstance(h, int) or isinstance(h, bool)
             or not isinstance(w, int) or isinstance(w, bool)
-            or h < 1 or w < 1 or h > MAX_SIDE or w > MAX_SIDE):
-        raise ValueError(f"malformed shape in TransformResult: {result.shape}")
-    if len(result.layouts) != result.levels:
+            or not isinstance(levels, int) or isinstance(levels, bool)
+            or h < 1 or w < 1 or h > MAX_SIDE or w > MAX_SIDE
+            or levels < 1):
+        raise ValueError(f"malformed shape/levels in TransformResult: "
+                         f"shape={result.shape}, levels={levels}")
+    if len(result.layouts) != levels:
         raise ValueError("malformed TransformResult: layouts/levels mismatch")
-    for layout in result.layouts:
-        r0, r1 = layout.rows
-        c0, c1 = layout.cols
-        if not (0 <= r0 < r1 <= h and 0 <= c0 < c1 <= w):
-            raise ValueError(
-                f"malformed layout at level {layout.level}: "
-                f"rows {layout.rows}, cols {layout.cols} outside shape"
-            )
+
+    # Every layout must be exactly the canonical layout deterministically
+    # derived from shape + level count; this rejects tampered metadata rather
+    # than trusting it.  The level-count rule is re-checked here as well.
+    _check_levels(h, w, levels)
+    canonical = _build_layouts(h, w, levels)
+    if result.layouts != canonical:
+        raise ValueError(
+            "malformed TransformResult: layouts do not match the canonical "
+            "layout derived from shape and levels"
+        )
+
+    expected_aggregate = _aggregate_subbands(canonical, levels)
+    if result.subbands != expected_aggregate:
+        raise ValueError(
+            "malformed TransformResult: subband list does not match layouts"
+        )
     return result
 
 

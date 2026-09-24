@@ -343,6 +343,35 @@ def max_levels(height: int, width: int) -> int:
     return count
 
 
+def _build_layouts(h: int, w: int, levels: int) -> tuple[LevelLayout, ...]:
+    """Compute the deterministic level/subband geometry for ``h x w``.
+
+    ``levels`` is assumed to have already passed the same validation as in
+    :func:`dwt2d` (including the 1x1 single-identity-level rule).  The
+    forward transform and the bitstream decoder share this helper so that
+    decoded coefficients always carry exactly the layout they were encoded
+    with.
+    """
+    layouts: list[LevelLayout] = []
+    r0 = c0 = 0
+    r1, c1 = h, w
+    for level in range(1, levels + 1):
+        lr = (r1 - r0 + 1) // 2
+        lc = (c1 - c0 + 1) // 2
+        bands = (
+            Subband("LL", level, (r0, r0 + lr), (c0, c0 + lc)),
+            Subband("LH", level, (r0, r0 + lr), (c0 + lc, c1)),
+            Subband("HL", level, (r0 + lr, r1), (c0, c0 + lc)),
+            Subband("HH", level, (r0 + lr, r1), (c0 + lc, c1)),
+        )
+        layouts.append(
+            LevelLayout(level, (r0, r1), (c0, c1), lr, lc, bands)
+        )
+        r1 = r0 + lr
+        c1 = c0 + lc
+    return tuple(layouts)
+
+
 def dwt2d(image: Sequence[Sequence[int]], levels: int = 1) -> TransformResult:
     """Forward 2D reversible 5/3 lifting decomposition.
 
@@ -369,25 +398,11 @@ def dwt2d(image: Sequence[Sequence[int]], levels: int = 1) -> TransformResult:
                 f"further levels would be identity on a 1x1 LL block"
             )
 
-    layouts: list[LevelLayout] = []
-    r0 = c0 = 0
-    r1, c1 = h, w
-    for level in range(1, levels + 1):
+    layouts = _build_layouts(h, w, levels)
+    for layout in layouts:
+        r0, r1 = layout.rows
+        c0, c1 = layout.cols
         _fwd_block(a, r0, r1, c0, c1)
-        lr = (r1 - r0 + 1) // 2
-        lc = (c1 - c0 + 1) // 2
-        bands = (
-            Subband("LL", level, (r0, r0 + lr), (c0, c0 + lc)),
-            Subband("LH", level, (r0, r0 + lr), (c0 + lc, c1)),
-            Subband("HL", level, (r0 + lr, r1), (c0, c0 + lc)),
-            Subband("HH", level, (r0 + lr, r1), (c0 + lc, c1)),
-        )
-        layouts.append(
-            LevelLayout(level, (r0, r1), (c0, c1), lr, lc, bands)
-        )
-        # Multi-level: recurse into the LL region only.
-        r1 = r0 + lr
-        c1 = c0 + lc
 
     aggregate = tuple(
         b

@@ -444,3 +444,330 @@ def idwt2d(result: TransformResult) -> tuple[tuple[int, ...], ...]:
         _inv_block(a, r0, r1, c0, c1)
 
     return tuple(tuple(row) for row in a)
+
+
+# ---------------------------------------------------------------------------
+# Partial inverse driven by a requested output ROI (no full reconstruction)
+# ---------------------------------------------------------------------------
+
+def _dep1d_indices(out_indices: set[int], n: int) -> set[int]:
+    """Coefficient indices needed to reconstruct out_indices of length n.
+
+    Derived directly from the inverse lifting dependency:
+
+    * even[2k] needs approx[k] (and details k-1/k to undo update);
+    * odd[2j+1] needs detail[j] plus even[j] and clamped even[j+1].
+
+    Returns indices into the deinterleaved coefficient vector (approx first,
+    detail after).  Clamped (replicated) neighbours are real valid
+    coefficients, so they appear as actual reads; missing out-of-range
+    samples are never synthesised as zeros.
+    """
+    if n == 1:
+        return {0} if 0 in out_indices else set()
+    low_count = (n + 1) // 2
+    high_count = n // 2
+    approx_needed: set[int] = set()
+    for i in out_indices:
+        if i % 2 == 0:
+            approx_needed.add(i // 2)
+        else:
+            j = i // 2
+            approx_needed.add(j)
+            approx_needed.add(min(j + 1, low_count - 1))
+    detail_needed: set[int] = set()
+    for k in approx_needed:
+        # Undo-update reads detail[k-1 clamped] and detail[k clamped].
+        if k >= 1:
+            detail_needed.add(k - 1)
+        if k < high_count:
+            detail_needed.add(k)
+        else:
+            detail_needed.add(high_count - 1)
+    return approx_needed | {low_count + j for j in detail_needed}
+
+
+def _inv1d_partial(
+    coeffs: dict[int, int],
+    n: int,
+    out_indices: set[int],
+    ctx: str,
+) -> dict[int, int]:
+    """Inverse 1D lifting producing only requested output indices.
+
+    coeffs must cover exactly the deinterleaved positions returned by
+    _dep1d_indices.  Same arithmetic and overflow checks as the full _inv1d.
+    """
+    if n == 1:
+        return {0: _bounded(coeffs[0], f"{ctx}: identity sample")}
+
+    low_count = (n + 1) // 2
+    high_count = n // 2
+
+    approx_needed: set[int] = set()
+    for i in out_indices:
+        if i % 2 == 0:
+            approx_needed.add(i // 2)
+        else:
+            j = i // 2
+            approx_needed.add(j)
+            approx_needed.add(min(j + 1, low_count - 1))
+
+    ev: dict[int, int] = {}
+    for k in approx_needed:
+        dl = coeffs[low_count + (k - 1 if k >= 1 else 0)]
+        dr = coeffs[low_count + (k if k < high_count else high_count - 1)]
+        total = _bounded(dl + dr, f"{ctx}: detail sum, even {k}")
+        total = _bounded(total + 2, f"{ctx}: detail sum + 2, even {k}")
+        ev[k] = _bounded(
+            coeffs[k] - total // 4, f"{ctx}: inverse-update result, even {k}"
+        )
+
+    out: dict[int, int] = {}
+    for i in out_indices:
+        if i % 2 == 0:
+            out[i] = ev[i // 2]
+        else:
+            j = i // 2
+            left = ev[j]
+            right = ev[min(j + 1, low_count - 1)]
+            total = _bounded(left + right, f"{ctx}: even-neighbour sum, odd {j}")
+            out[i] = _bounded(
+                coeffs[low_count + j] + total // 2,
+                f"{ctx}: inverse-prediction result, odd {j}",
+            )
+    return out
+
+
+def _pair_of_ints(value: object, name: str) -> tuple[int, int]:
+    if not _is_real_sequence(value) or len(value) != 2:
+        raise TypeError(
+            f"{name} must be a sequence of exactly 2 ints "
+            f"(got {type(value).__name__})"
+        )
+    out = []
+    for i, v in enumerate(value):
+        if isinstance(v, bool) or not isinstance(v, int):
+            raise TypeError(
+                f"{name}[{i}] must be int, got {type(v).__name__} {v!r}"
+            )
+        out.append(v)
+    return out[0], out[1]
+
+
+def _validate_roi(roi: object, h: int, w: int) -> tuple[int, int, int, int]:
+    if not _is_real_sequence(roi) or len(roi) != 4:
+        raise TypeError(
+            "roi must be a sequence of exactly 4 ints "
+            f"(r0, r1, c0, c1); got {type(roi).__name__}"
+        )
+    names = ("r0", "r1", "c0", "c1")
+    vals: list[int] = []
+    for name, v in zip(names, roi):
+        if isinstance(v, bool) or not isinstance(v, int):
+            raise TypeError(
+                f"roi {name} must be int, got {type(v).__name__} {v!r}"
+            )
+        vals.append(v)
+    r0, r1, c0, c1 = vals
+    if not (0 <= r0 < r1 <= h):
+        raise ValueError(
+            f"roi rows [{r0}, {r1}) are invalid for image height {h}; "
+            f"need 0 <= r0 < r1 <= {h}"
+        )
+    if not (0 <= c0 < c1 <= w):
+        raise ValueError(
+            f"roi cols [{c0}, {c1}) are invalid for image width {w}; "
+            f"need 0 <= c0 < c1 <= {w}"
+        )
+    return r0, r1, c0, c1
+
+
+def idwt2d_roi(
+    shape: Sequence[int],
+    levels: int,
+    roi: Sequence[int],
+    read,
+) -> tuple[tuple[int, ...], ...]:
+    """Reconstruct only the pixels of the half-open rectangle roi.
+
+    shape is (height, width), levels is the number of decomposition levels,
+    roi is (r0, r1, c0, c1) with 0 <= r0 < r1 <= height and
+    0 <= c0 < c1 <= width.  Coefficients are fetched on demand through
+    read(name, level, row, col), where name is "LL" (deepest level only),
+    "LH", "HL" or "HH" and (row, col) are coefficient-matrix coordinates
+    (the same coordinates reported by Subband).  Each needed coordinate is
+    read at most once; the caller owns the access log and may cache.
+
+    The required coefficient set is derived level by level from the 5/3
+    inverse lifting dependencies (including same-kind clamped neighbours),
+    then the pyramid is rebuilt bottom-up inside that halo.  Coefficients
+    outside the dependency are never requested and never assumed zero; the
+    image is never fully reconstructed merely to crop it afterwards.  Every
+    argument, including roi, is validated before read is called.
+    """
+    if not callable(read):
+        raise TypeError(f"read must be callable (got {type(read).__name__})")
+    h, w = _pair_of_ints(shape, "shape")
+    if h < 1 or w < 1 or h > MAX_SIDE or w > MAX_SIDE:
+        raise ValueError(
+            f"shape {h}x{w} must satisfy 1 <= side <= {MAX_SIDE}"
+        )
+    levels = _positive_int_param(levels, "levels")
+    limit = max_levels(h, w)
+    if levels > limit and not (limit == 0 and levels == 1):
+        raise ValueError(
+            f"levels={levels} exceeds max_levels({h}, {w})={limit}"
+        )
+    r0, r1, c0, c1 = _validate_roi(roi, h, w)
+
+    # Working-region dimensions per level (all regions start at (0, 0)).
+    dims: list[tuple[int, int]] = []
+    hh, ww = h, w
+    for _ in range(levels):
+        dims.append((hh, ww))
+        hh = (hh + 1) // 2
+        ww = (ww + 1) // 2
+
+    # Top-down dependency propagation.
+    # need_rows/cols[L]: positions the level L inverse must produce.
+    # coeff_rows/cols[L]: coefficient positions used at level L.
+    need_rows: list[set[int] | None] = [None] * (levels + 1)
+    need_cols: list[set[int] | None] = [None] * (levels + 1)
+    coeff_rows: list[set[int] | None] = [None] * (levels + 1)
+    coeff_cols: list[set[int] | None] = [None] * (levels + 1)
+    need_rows[1] = set(range(r0, r1))
+    need_cols[1] = set(range(c0, c1))
+    for level in range(1, levels + 1):
+        hh, ww = dims[level - 1]
+        rows = _dep1d_indices(need_rows[level], hh)
+        cols = _dep1d_indices(need_cols[level], ww)
+        coeff_rows[level] = rows
+        coeff_cols[level] = cols
+        if level < levels:
+            lr = (hh + 1) // 2
+            lc = (ww + 1) // 2
+            need_rows[level + 1] = {r for r in rows if r < lr}
+            need_cols[level + 1] = {c for c in cols if c < lc}
+
+    # Bottom-up partial reconstruction.  values holds the sparse values of
+    # the level currently being inverted; its LL entries were produced by the
+    # preceding deeper iteration.
+    values: dict[tuple[int, int], int] = {}
+    output: list[list[int]] = [[0] * (c1 - c0) for _ in range(r1 - r0)]
+
+    for level in range(levels, 0, -1):
+        hh, ww = dims[level - 1]
+        lr = (hh + 1) // 2
+        lc = (ww + 1) // 2
+        rows = coeff_rows[level]
+        cols = coeff_cols[level]
+        out_rows = need_rows[level]
+        out_cols = need_cols[level]
+
+        # Fetch stored coefficients needed at this level.  The LL quadrant is
+        # stored only at the deepest level; otherwise it is the deeper
+        # level's reconstructed output already present in values.
+        for rr in rows:
+            for cc in cols:
+                in_ll = rr < lr and cc < lc
+                if level < levels and in_ll:
+                    continue
+                if in_ll:
+                    band = "LL"
+                elif rr < lr:
+                    band = "LH"
+                elif cc < lc:
+                    band = "HL"
+                else:
+                    band = "HH"
+                raw = read(band, level, rr, cc)
+                values[(rr, cc)] = _scalar(
+                    raw,
+                    f"read({band!r}, level={level}, row={rr}, col={cc})",
+                )
+
+        # Strict inverse order: columns first.
+        post_columns: dict[tuple[int, int], int] = {}
+        for cc in cols:
+            col_coeffs = {rr: values[(rr, cc)] for rr in rows}
+            produced = _inv1d_partial(
+                col_coeffs, hh, out_rows, f"column {cc} (level {level})"
+            )
+            for rr, v in produced.items():
+                post_columns[(rr, cc)] = v
+
+        # Then rows.
+        for rr in out_rows:
+            row_coeffs = {cc: post_columns[(rr, cc)] for cc in cols}
+            produced = _inv1d_partial(
+                row_coeffs, ww, out_cols, f"row {rr} (level {level})"
+            )
+            for cc, v in produced.items():
+                if level == 1:
+                    output[rr - r0][cc - c0] = v
+                else:
+                    # Becomes a stored LL coefficient for the level above.
+                    values[(rr, cc)] = v
+
+    return tuple(tuple(row) for row in output)
+
+
+class CoefficientReader:
+    """Read-only idwt2d_roi callback over a TransformResult.
+
+    Calling the instance as reader(name, level, row, col) returns the
+    recorded coefficient and appends the coefficient-matrix coordinate to
+    accessed (a tuple (name, level, row, col)).  Reads outside the declared
+    subband rectangle are rejected with ValueError, so the reader doubles as
+    a locality guard.
+    """
+
+    def __init__(self, result: TransformResult):
+        result = _validate_result(result)
+        checked = _validate_matrix(result.coefficients, "coefficients")
+        if (len(checked), len(checked[0])) != result.shape:
+            raise ValueError(
+                f"coefficient matrix shape {len(checked)}x{len(checked[0])} "
+                f"does not match recorded shape {result.shape[0]}x{result.shape[1]}"
+            )
+        self._rows = checked
+        self._result = result
+        self.accessed: list[tuple[str, int, int, int]] = []
+
+    def __call__(self, name: object, level: object, row: object, col: object) -> int:
+        if (not isinstance(name, str)
+                or name not in ("LL", "LH", "HL", "HH")):
+            raise ValueError(f"unknown subband name {name!r}")
+        if isinstance(level, bool) or not isinstance(level, int):
+            raise TypeError(f"level must be int, got {type(level).__name__}")
+        if isinstance(row, bool) or not isinstance(row, int):
+            raise TypeError(f"row must be int, got {type(row).__name__}")
+        if isinstance(col, bool) or not isinstance(col, int):
+            raise TypeError(f"col must be int, got {type(col).__name__}")
+        try:
+            band = self._result.band(name, level)
+        except KeyError:
+            raise ValueError(
+                f"subband {name!r} level {level} does not exist in this result"
+            ) from None
+        if name == "LL" and level < self._result.levels:
+            raise ValueError(
+                f"LL of level {level} is an interior working region, not a "
+                f"stored subband; only LL of the deepest level "
+                f"{self._result.levels} can be read"
+            )
+        r0, r1 = band.rows
+        c0, c1 = band.cols
+        if not (r0 <= row < r1 and c0 <= col < c1):
+            raise ValueError(
+                f"read outside {name}(level {level}) rectangle rows[{r0},{r1}) "
+                f"cols[{c0},{c1}): ({row}, {col})"
+            )
+        self.accessed.append((name, level, row, col))
+        return self._rows[row][col]
+
+
+def make_reader(result: TransformResult) -> CoefficientReader:
+    """Build a CoefficientReader for a TransformResult."""
+    return CoefficientReader(result)

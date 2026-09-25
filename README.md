@@ -15,25 +15,65 @@
 
 ```bash
 # 必要测试（独立参考 + 手算常量 + 往返补充）
-python -m unittest discover -s tests -v
+./.venv/bin/python -m unittest discover -s tests -v
 
-# 固定输入演示（真实计算，含一个正常多层结果与两个实际触发的拒绝边界）
-python demo.py
+# 固定输入演示（真实计算：多层全量/ROI 结果与三个实际触发的拒绝边界）
+./.venv/bin/python demo.py
 ```
 
-demo 为小规模固定输入（7×5 两层等），真实计算、无 `sleep`、无预录结果，
-正常机器上耗时远小于 1 秒（题面预算约 8 秒内）。
+隔离环境用 Linux 原生 Python 3.14.7 建立，仅需标准库：
+
+```bash
+/opt/task-python-3.14.7/bin/python3.14 -m venv .venv
+```
+
+demo 为小规模固定输入（7×5 两层及一个 11×9 四层 ROI 例等），真实计算、
+无 `sleep`、无预录结果，正常机器上耗时远小于 1 秒（题面预算约 90 秒内）。
 
 ## 接口
 
 ```python
-from lifting53 import dwt2d, idwt2d, dwt1d, idwt1d, max_levels
+from lifting53 import (
+    dwt2d, idwt2d, dwt1d, idwt1d, max_levels,
+    idwt2d_roi, make_reader,
+)
 
 result = dwt2d(image, levels=1)
 # image: Sequence[Sequence[int]]，矩形整数矩阵，不被修改
 # result: TransformResult
 reconstructed = idwt2d(result)          # 逐位恢复原矩阵
+
+# 只还原一个半开矩形 ROI（先行后列的严格逆序，按 5/3 依赖逐层推导系数）
+reader = make_reader(result)            # 只读回调，自动记录 accessed 坐标
+pixels = idwt2d_roi((h, w), levels, (r0, r1, c0, c1), reader)
+# pixels: r0..r1-1 行、c0..c1-1 列的像素；reader.accessed 为实际读取的
+# (子带名, 层, 行, 列) 列表（坐标为完整系数矩阵坐标）
 ```
+
+ROI 逆变换：
+
+- `idwt2d_roi(shape, levels, roi, read)`
+  - `shape=(height, width)`、`levels` 与正变换相同（奇数宽高、多层 LL
+    尺寸均支持，1×1 接受恰好 1 层恒等）。
+  - `roi=(r0, r1, c0, c1)` 为**半开**矩形：
+    `0 <= r0 < r1 <= height`、`0 <= c0 < c1 <= width`。
+  - `read(name, level, row, col) -> int` 为只读回调：`name` 为
+    `"LL"`（仅最深层）、`"LH"`、`"HL"`、`"HH"`；`(row, col)` 是系数
+    矩阵中的绝对坐标，与 `Subband.rows/cols` 一致。每个所需坐标在一次
+    请求内至多读取一次；同一请求内允许缓存，矩形依赖之外的系数**不会**
+    被读取，也不会被当作零。
+  - 实现按 5/3 逆提升的真实依赖自顶向下推导每层所需的近似/细节下标
+    （含夹取复制的同类邻居），再自底向上只重建该 halo；不是“完整重建后
+    裁剪”。长度 1 的行/列走恒等，溢出规则（int63、不截断）与全量逆变换
+    完全一致。
+  - **必要 halo 可能比 ROI 大**：单个像素需要其提升邻域的近似与细节，
+    多层时这些需求逐层向上传播；跨子带边界的 ROI 还会同时读取相邻多个
+    子带。这是依赖关系决定的，不是冗余读取。
+- `make_reader(result)` 返回 `CoefficientReader`：对 `TransformResult`
+  的只读回调，`accessed` 列表记录每次实际访问；读取坐标越出该子带声明
+  矩形、或在非最深层请求 `LL`（内部工作区而非存储子带）时抛
+  `ValueError`，可直接用作局部性守卫。自定义回调只要满足同样的
+  `(name, level, row, col)` 约定即可。
 
 公开数据结构（冻结 dataclass，不可变）：
 
@@ -60,6 +100,15 @@ reconstructed = idwt2d(result)          # 逐位恢复原矩阵
 - `IntegerLiftingError`：本包异常基类。
 - `IntegerOverflowError(IntegerLiftingError, OverflowError)`：输入或受检中间
   整数绝对值超过 `2^63 - 1` 时抛出，**绝不截断或回绕**。
+- ROI 入口的错误状态（全部在任何回调读取**之前**完成结构性校验，非法
+  请求不产生任何读取）：
+  - `TypeError`：`shape`/`levels`/`roi` 不是整数（`bool` 拒绝）、
+    `read` 不可调用、回调返回非整数（含 `float`/`NaN`/`Infinity`，
+    规则同输入校验）。
+  - `ValueError`：ROI 越界或为空（`r0 >= r1`、`c0 >= c1`、端点超出
+    图像）、边长不在 `1..128`、`levels` 超过 `max_levels`、`roi` 不是
+    4 元素序列；回调返回的系数在重建中间表达式触发 int63 溢出时抛
+    `IntegerOverflowError`，与全量逆变换同一检查点。
 - 非法输入抛 `TypeError` / `ValueError`，错误信息带可定位坐标，例如
   `image[1][2]`、`signal[3]`、`row 2`、`column 4`。
 
@@ -134,8 +183,11 @@ LL / LH（行高频）/ HL（列高频）/ HH 四个子带。多层时**只递�
 
 - 仅实现本题契约的数学子集：单层与多层 Mallat 式二维分解、上述对称夹取
   边界、int63 数值边界。**不宣称**与 JPEG 2000 等行业标准的完整兼容
-  （不包含量化、ROI、码流、分量变换、规范规定的边界模式切换等）。
+  （不包含码流、分量变换、规范规定的边界模式切换等；像素域半开矩形
+  ROI 局部逆变换已由 `idwt2d_roi` 提供，但不是 JPEG 2000 式渐进码流 ROI）。
 - 不包含二维非矩形、非整数、复数或浮点输入；超出 128×128 直接拒绝。
+- ROI 功能是“给定系数后的像素域局部逆变换”，不包含渐进码流、图像浏览
+  器或任意形状 ROI；ROI 始终为轴对齐半开矩形。
 - 大绝对值数据可能因受检中间和超界而抛 `IntegerOverflowError`（这是显式
   边界，非静默截断）；典型图像量级远低于此。
 - 纯 Python 实现面向正确性与可复用性，未做向量化/原生加速；128×128 规模
@@ -145,8 +197,9 @@ LL / LH（行高频）/ HL（列高频）/ HH 四个子带。多层时**只递�
 
 ```
 lifting53/__init__.py   # 公开 API
-lifting53/_core.py      # 核心：校验、一维提升、二维分块、元数据、逆变换
+lifting53/_core.py      # 校验、一维提升、二维分块、元数据、全量/ROI 逆变换
 tests/test_lifting.py   # 独立参考、手算常量、边界/溢出/元数据/往返测试
-demo.py                 # 固定输入演示
+tests/test_roi.py       # ROI：独立参考、角点/跨子带/1×N/全部边界、局部性
+demo.py                 # 固定输入演示（含 ROI 局部还原与访问统计）
 requirements.txt        # 无第三方依赖（占位说明）
 ```

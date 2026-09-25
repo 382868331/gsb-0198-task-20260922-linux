@@ -17,7 +17,9 @@ from lifting53 import (
     IntegerOverflowError,
     dwt1d,
     dwt2d,
+    idwt2d_roi,
     idwt2d,
+    make_reader,
     max_levels,
 )
 
@@ -127,6 +129,55 @@ def main() -> None:
 
     print("\ndemo finished: one normal multilevel result with bit-exact")
     print("recovery, and two genuinely triggered documented rejections.")
+
+    print()
+    print("=" * 68)
+    print("Part 3: ROI inverse with a read-only coefficient callback")
+    print("=" * 68)
+    roi_h, roi_w = 11, 9
+    roi_img = make_image(roi_h, roi_w)
+    roi_levels = max_levels(roi_h, roi_w)
+    roi_result = dwt2d(roi_img, levels=roi_levels)
+    full = idwt2d(roi_result)
+    rect = (3, 7, 2, 8)
+    r0, r1, c0, c1 = rect
+    reader = make_reader(roi_result)
+    got = idwt2d_roi((roi_h, roi_w), roi_levels, rect, reader)
+    expected = tuple(row[c0:c1] for row in full[r0:r1])
+    assert got == expected
+    total = roi_h * roi_w
+    by_band = {}
+    for name, level, _r, _c in reader.accessed:
+        by_band[(name, level)] = by_band.get((name, level), 0) + 1
+    print(f"image {roi_h}x{roi_w}, {roi_levels} levels; ROI = rows [{r0},{r1}), "
+          f"cols [{c0},{c1})")
+    print("reconstructed ROI pixels:")
+    for row in got:
+        print("  " + "  ".join(f"{v:4d}" for v in row))
+    print(f"coefficients actually read: {len(reader.accessed)} / {total} "
+          f"(full image has {total}); per stored subband: {dict(sorted(by_band.items()))}")
+    print("each access was within that subband (CoefficientReader rejects "
+          "anything else), and bit-exactly equals the independent full "
+          "reconstruction cropped to the ROI.")
+
+    # Single corner pixel: the required halo is much larger than the pixel.
+    corner_reader = make_reader(roi_result)
+    corner = idwt2d_roi((roi_h, roi_w), roi_levels, (0, 1, 0, 1), corner_reader)
+    assert corner == ((roi_img[0][0],),)
+    print(f"corner pixel (0,0) alone needed {len(corner_reader.accessed)} "
+          f"coefficients across the whole pyramid: the required halo is "
+          f"necessarily larger than the requested pixel.")
+
+    # Invalid ROI must be rejected before any coefficient is read.
+    def no_reads(*_args):
+        raise AssertionError("callback must not be called for an invalid ROI")
+
+    try:
+        idwt2d_roi((roi_h, roi_w), roi_levels, (0, 1, roi_w, roi_w + 1), no_reads)
+    except ValueError as exc:
+        print(f"invalid ROI rejected before any read: {type(exc).__name__}: {exc}")
+    else:
+        raise AssertionError("invalid ROI boundary was not triggered")
 
 
 if __name__ == "__main__":

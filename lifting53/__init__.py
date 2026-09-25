@@ -14,6 +14,7 @@ Constants: INT63_MAX = 2**63 - 1, MAX_SIDE = 128.
 from ._core import (
     INT63_MAX,
     MAX_SIDE,
+    CoefficientReader,
     IntegerLiftingError,
     IntegerOverflowError,
     LevelLayout,
@@ -21,14 +22,17 @@ from ._core import (
     TransformResult,
     dwt1d,
     dwt2d,
+    idwt2d_roi,
     idwt1d,
     idwt2d,
+    make_reader,
     max_levels,
 )
 
 __all__ = [
     "INT63_MAX",
     "MAX_SIDE",
+    "CoefficientReader",
     "IntegerLiftingError",
     "IntegerOverflowError",
     "LevelLayout",
@@ -36,8 +40,10 @@ __all__ = [
     "TransformResult",
     "dwt1d",
     "dwt2d",
+    "idwt2d_roi",
     "idwt1d",
     "idwt2d",
+    "make_reader",
     "max_levels",
 ]
 

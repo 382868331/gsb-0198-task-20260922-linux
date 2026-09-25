@@ -129,5 +129,88 @@ def main() -> None:
     print("recovery, and two genuinely triggered documented rejections.")
 
 
+# ---------------------------------------------------------------------------
+# Part 3: ROI-local inverse reconstruction
+# ---------------------------------------------------------------------------
+
+def demo_roi() -> None:
+    print("=" * 68)
+    print("Part 3: ROI inverse - reconstruct a half-open rectangle only")
+    print("=" * 68)
+    from lifting53 import idwt2d_roi, roi_access_plan, ROIError
+
+    h, w, levels = 7, 5, 2
+    image = make_image(h, w)
+    result = dwt2d(image, levels=levels)
+    full = idwt2d(result)
+
+    rows, cols = (4, 7), (2, 5)  # bottom-right 3x3 half-open rectangle
+    plan = roi_access_plan(result, rows, cols)
+    accessed = []
+
+    def strict_reader(name, level, r, c):
+        key = (name, level, r, c)
+        allowed = {(a.name, a.level, a.row, a.col)
+                   for a in plan.coordinates()}
+        if key not in allowed:
+            raise AssertionError(f"unplanned access: {key}")
+        band = result.band(name, level)
+        accessed.append(key)
+        return result.coefficients[band.rows[0] + r][band.cols[0] + c]
+
+    print(f"requested ROI rows={rows} cols={cols} of {h}x{w}, "
+          f"levels={levels}")
+    print("static dependency plan (bounding boxes, subband-local):")
+    for band in plan.bands:
+        print(f"  {band.name} L{band.level}: rows={band.rows} cols={band.cols} "
+              f"points={len(band.coordinates)}")
+    n_forced = len(plan.coordinates())
+    roi_pixels = (rows[1] - rows[0]) * (cols[1] - cols[0])
+    print(f"forced coefficients: {n_forced} of {h * w} "
+          f"(whole pyramid has {h * w}); ROI has {roi_pixels} pixels")
+
+    roi = idwt2d_roi(result, rows, cols, strict_reader)
+    expected = tuple(row[cols[0]:cols[1]]
+                     for row in full[rows[0]:rows[1]])
+    print("ROI output:")
+    for row in roi:
+        print("  " + "  ".join(f"{v:4d}" for v in row))
+    print(f"matches independent full-inverse crop: {roi == expected}; "
+          f"callback reads: {len(accessed)} (each forced coordinate once)")
+    assert roi == expected
+    assert len(accessed) == n_forced == len(set(accessed))
+
+    # Single corner pixel: the halo crosses subbands and levels but is tiny.
+    corner_plan = roi_access_plan(result, (0, 1), (0, 1))
+    corner_cb = []
+
+    def corner_reader(name, level, r, c):
+        corner_cb.append((name, level, r, c))
+        band = result.band(name, level)
+        return result.coefficients[band.rows[0] + r][band.cols[0] + c]
+
+    pixel = idwt2d_roi(result, (0, 1), (0, 1), corner_reader)
+    print(f"corner pixel (0,0)={pixel[0][0]!r} forced "
+          f"{len(corner_plan.coordinates())} coefficients across "
+          f"{sorted({(a.name, a.level) for a in corner_plan.coordinates()})}")
+    print("(the halo is larger than the 1 pixel ROI because clamped lifting "
+          "neighbours and the deeper LL block are genuine dependencies)")
+
+    # Invalid ROI: rejected before any coefficient is read.
+    def must_not_run(*args):
+        raise AssertionError("callback must not be called")
+
+    for bad_rows, bad_cols in [((h, h + 1), (0, 1)), ((0, 1), (0, 0))]:
+        try:
+            idwt2d_roi(result, bad_rows, bad_cols, must_not_run)
+        except ROIError as exc:
+            print(f"invalid ROI rows={bad_rows} cols={bad_cols} -> "
+                  f"{type(exc).__name__}: {exc}")
+        else:
+            raise AssertionError("invalid ROI was not rejected")
+    print()
+
+
 if __name__ == "__main__":
     main()
+    demo_roi()

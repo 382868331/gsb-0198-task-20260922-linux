@@ -11,14 +11,27 @@
 - **依赖**：无。`requirements.txt` 仅为占位说明。安装 Python 后直接运行，
   不需要网络、账号、密钥、硬件、数据库、中间件、云 API 或 Docker。
 
+## 隔离 venv 准备
+
+不需要任何第三方包，venv 仅用于隔离解释器环境：
+
+```bash
+python3.14 -m venv .venv          # 需要 Linux 原生 Python 3.14.7
+. .venv/bin/activate              # 或直接使用 .venv/bin/python
+python -V                         # 应显示 Python 3.14.7
+```
+
 ## 准确命令
 
 ```bash
-# 必要测试（独立参考 + 手算常量 + 往返补充）
+# 必要测试（基线回归 + 自适应增量：独立参考 + 枚举核对 + 往返补充）
 python -m unittest discover -s tests -v
 
-# 固定输入演示（真实计算，含一个正常多层结果与两个实际触发的拒绝边界）
+# 基线固定输入演示（真实计算，含一个正常多层结果与两个实际触发的拒绝边界）
 python demo.py
+
+# 自适应四叉树分解演示（真实离线计算，预算 90 秒，实测远低于 1 秒）
+python demo_iteration.py
 ```
 
 demo 为小规模固定输入（7×5 两层等），真实计算、无 `sleep`、无预录结果，
@@ -130,6 +143,47 @@ LL / LH（行高频）/ HL（列高频）/ HH 四个子带。多层时**只递�
   `tests/test_lifting.py` 顶部），**不调用被测核心**；手算小例与负数参考
   以常量形式写死。往返一致只作为补充测试。
 
+## 自适应四叉树分解（增量功能）
+
+基线 `dwt2d` 只递归分解 LL 低频块。增量接口 `dwt2d_adaptive` 允许
+**四个子带（LL/LH/HL/HH）各自继续做同一 5/3 提升**，构建到给定深度
+`depth` 的完整四叉树后，用调用方提供的**每块代价**自底向上剪枝：每个
+内部节点在“保留父块”与“展开为四个（已递归剪枝的）子块”之间取总代价
+更小者，**并列时优先浅层表示**（保留父块）。由于各子树相互独立，该
+自底向上过程对整棵树是最优的；测试用小树穷举全部剪枝选择核对了最优性。
+
+```python
+from lifting53 import dwt2d_adaptive, idwt2d_adaptive, integer_coding_length
+
+result = dwt2d_adaptive(image, depth=3)            # 默认代价
+result = dwt2d_adaptive(image, depth=3, cost=my_cost)  # 调用方代价
+# my_cost(block) -> 非负 int；block 为 tuple[tuple[int, ...], ...]
+image2 = idwt2d_adaptive(result)                   # 按树精确还原
+```
+
+公开数据结构：
+
+- `AdaptiveResult`：`root`（剪枝后的完整分解树）、`shape`、`depth`、
+  `total_cost`（剪枝表示的总代价）、`cost_description`；`leaves()`
+  返回全部叶节点。
+- `AdaptiveNode`：`band`（`"ROOT"` 或 LL/LH/HL/HH）、`depth`（根为 0）、
+  `shape`、`coefficients`（本节点自己的块，叶节点即被保留的系数）、
+  `children`（叶为 `None`，否则恰好 4 个、按 LL/LH/HL/HH 顺序、形状为
+  父块的精确象限划分）。各叶系数与形状均可直接从树读出。
+- `integer_coding_length(block)`：**默认代价，显式整数编码长度估计**——
+  每个系数估计 `1 + bit_length(|v|)` 比特。它只是用于比较表示优劣的
+  确定估计，**不是也不宣称是任何真实压缩文件的大小**。
+
+契约要点：
+
+- 奇数边长与 1×N / N×1 / 1×1 直接按提升定义处理（长度 1 恒等、空子带为
+  零样本叶子），**不靠补零**，因此逆变换也无需裁切。
+- `idwt2d_adaptive` 先校验整棵树再重建：缺子块（子节点数不为 4）、子块
+  形状不等于父块象限划分（重叠或留缝）、叶系数形状不符、1×1 或空块携带
+  子节点、深度/带名不符等非法树一律抛 `InvalidTreeError` 拒绝。
+- `depth >= 1` 且不超过 `max(1, max_levels(h, w))`；代价函数必须返回
+  非负 `int`（拒绝 `bool`/`float`/负数）。
+
 ## 已知限制 / 范围声明
 
 - 仅实现本题契约的数学子集：单层与多层 Mallat 式二维分解、上述对称夹取
@@ -140,13 +194,20 @@ LL / LH（行高频）/ HL（列高频）/ HH 四个子带。多层时**只递�
   边界，非静默截断）；典型图像量级远低于此。
 - 纯 Python 实现面向正确性与可复用性，未做向量化/原生加速；128×128 规模
   下为亚秒级。
+- 自适应分解的默认代价是显式整数编码长度**估计**，用于在合法表示之间做
+  选择；它不对应任何真实压缩器输出，本库也不产出压缩文件格式。
+- 剪枝最优性针对“每个节点二选一（保留/展开）”的代价模型；代价函数必须
+  是纯函数式的每块非负整数代价。
 
 ## 仓库内容
 
 ```
 lifting53/__init__.py   # 公开 API
-lifting53/_core.py      # 核心：校验、一维提升、二维分块、元数据、逆变换
-tests/test_lifting.py   # 独立参考、手算常量、边界/溢出/元数据/往返测试
-demo.py                 # 固定输入演示
+lifting53/_core.py      # 基线核心：校验、一维提升、二维分块、元数据、逆变换
+lifting53/_adaptive.py  # 增量：四叉树自适应分解、代价剪枝、树校验逆变换
+tests/test_lifting.py   # 基线回归：独立参考、手算常量、边界/溢出/元数据/往返
+tests/test_adaptive.py  # 增量：独立参考逐层核对、小树枚举最优性、非法树拒绝
+demo.py                 # 基线固定输入演示
+demo_iteration.py       # 自适应分解演示（真实离线计算，< 90 秒）
 requirements.txt        # 无第三方依赖（占位说明）
 ```

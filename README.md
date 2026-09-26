@@ -10,6 +10,14 @@
   annotations`，无第三方包）。
 - **依赖**：无。`requirements.txt` 仅为占位说明。安装 Python 后直接运行，
   不需要网络、账号、密钥、硬件、数据库、中间件、云 API 或 Docker。
+- **隔离 venv（可选但推荐）**：本库不需要任何第三方包，venv 仅用于隔离
+  解释器环境：
+
+  ```bash
+  python3.14 -m venv .venv
+  . .venv/bin/activate
+  python -m unittest discover -s tests -v
+  ```
 
 ## 准确命令
 
@@ -19,6 +27,9 @@ python -m unittest discover -s tests -v
 
 # 固定输入演示（真实计算，含一个正常多层结果与两个实际触发的拒绝边界）
 python demo.py
+
+# 自适应四叉树分解演示（剪枝树、逐叶子代价、非法树拒绝；真实离线计算）
+python demo_iteration.py
 ```
 
 demo 为小规模固定输入（7×5 两层等），真实计算、无 `sleep`、无预录结果，
@@ -141,12 +152,60 @@ LL / LH（行高频）/ HL（列高频）/ HH 四个子带。多层时**只递�
 - 纯 Python 实现面向正确性与可复用性，未做向量化/原生加速；128×128 规模
   下为亚秒级。
 
+## 自适应四叉树分解（按数据选择分解哪一块）
+
+`lifting53/_packet.py` 在基线能力之上提供小波包式自适应分解：四个子带
+（LL/LH/HL/HH）**各自都可以继续做同一个 5/3 提升**，不再只递归低频块。
+先 `build_full_tree` 构建到给定深度的完整四叉树，再 `prune_tree` 用
+**调用方提供的每块代价**自底向上决策：每个内部节点比较“保留父块”与
+“展开为四个子块（各自已最优）”的总代价，取较小者；**相等时保留父块**，
+即并列优先更浅的表示。结果对所选代价是全局最优的（动态规划，每个节点
+的决策只依赖其子树）。
+
+```python
+from lifting53 import (
+    build_full_tree, prune_tree, adaptive_decompose, inverse_packet,
+    default_cost, leaf_cost_total, validate_tree,
+    PacketNode, InvalidTreeError, CHILD_BANDS,
+)
+
+full = build_full_tree(image, depth=3)     # 完整四叉树，每个节点都带系数
+tree = prune_tree(full, cost=my_cost)      # cost 省略时用 default_cost
+# tree = adaptive_decompose(image, 3, my_cost)   # 上面两步的合并写法
+for leaf in tree.leaves():                 # 完整分解树的全部叶子
+    print(leaf.band, leaf.shape, leaf.origin, leaf.coefficients)
+recovered = inverse_packet(tree)           # 按该树精确还原原整数图
+```
+
+- `PacketNode`（冻结 dataclass）：`band`（ROOT/LL/LH/HL/HH）、`depth`、
+  `origin`、`shape`、`coefficients`（该节点未再分解时的系数块）、
+  `children`（叶子为空元组，内部节点恰好 4 个、按 CHILD_BANDS 顺序）。
+- `cost` 回调签名：`cost(coefficients) -> 非负有限 int/float`；返回值
+  非法（负数、NaN/Inf、非数值、bool）会被拒绝。
+- `default_cost` 是**显式整数编码长度估计**：每个系数计
+  `1 + abs(v).bit_length()` 位（1 个符号位 + 幅值位长，0 计 1 位）。
+  它只是显式编码长度的估计，**不是任何真实压缩文件的大小**。
+- 奇数边长与单行/单列沿用同一套夹取边界提升规则：1×N 块行向恒等、列向
+  继续分裂，0×k / k×0 空子带无样本；**不补零，因此也无需裁切**。
+- `inverse_packet` / `prune_tree` / `leaf_cost_total` 先调用
+  `validate_tree`：缺子块、子块形状或原点与父块铺砌不一致（叶子重叠或
+  留缝）、系数形状不符、非整数/超界数值都会在任何运算前抛
+  `InvalidTreeError(IntegerLiftingError, ValueError)`。
+- 深度 `depth >= 1`；块到 1×1（或某维为空）自然停止，提前成为叶子。
+
+适用范围：与基线相同（矩形整数图、边长 ≤ 128、int63 数值边界、纯标准库
+离线运行）。树结构本身也是公开数据，调用方可自行构造/修改树再交给
+`inverse_packet`，但非法树会被拒绝而不是被静默纠正。
+
 ## 仓库内容
 
 ```
 lifting53/__init__.py   # 公开 API
 lifting53/_core.py      # 核心：校验、一维提升、二维分块、元数据、逆变换
-tests/test_lifting.py   # 独立参考、手算常量、边界/溢出/元数据/往返测试
-demo.py                 # 固定输入演示
+lifting53/_packet.py    # 自适应四叉树：全树构建、代价最优剪枝、树校验逆变换
+tests/test_lifting.py   # 基线：独立参考、手算常量、边界/溢出/元数据/往返测试
+tests/test_packet.py    # 增量：独立参考逐层系数、小树枚举最优性、非法树拒绝
+demo.py                 # 基线固定输入演示
+demo_iteration.py       # 自适应分解演示（真实离线计算，远小于 90 秒预算）
 requirements.txt        # 无第三方依赖（占位说明）
 ```

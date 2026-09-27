@@ -33,6 +33,9 @@ result = dwt2d(image, levels=1)
 # image: Sequence[Sequence[int]]，矩形整数矩阵，不被修改
 # result: TransformResult
 reconstructed = idwt2d(result)          # 逐位恢复原矩阵
+
+coarse = idwt2d(result, levels=1)       # 只撤销最深的 1 层，返回较粗图像
+deepest_ll = idwt2d(result, levels=0)   # 不做逆变换，直接取最深层 LL
 ```
 
 公开数据结构（冻结 dataclass，不可变）：
@@ -54,6 +57,21 @@ reconstructed = idwt2d(result)          # 逐位恢复原矩阵
 一维：`dwt1d(Sequence[int]) -> tuple[int, ...]`（前 ceil(n/2) 个为偶样本
 近似，后 floor(n/2) 个为奇样本细节），`idwt1d` 为严格逆。
 `max_levels(h, w)` 返回对该形状仍非恒等的最大层数。
+
+### 分层恢复（较粗分辨率）
+
+`idwt2d(result, levels=k)` 只撤销最深的 `k` 层（`levels=None` 即默认撤销
+全部 `result.levels` 层，逐位恢复原图）。设原分解层数为 L：
+
+- 输出尺寸规则：撤销 k 层后返回分解深度 `L - k` 处的图像，尺寸为
+  `result.shape` 各边做 `L - k` 次 ceil 减半（即第 `L - k + 1` 层的工作
+ 区域；`k = 0` 时为最深层 LL 块，不做任何逆变换，直接取出）。
+- 边界规则：每一层逆变换仍使用与正变换完全相同的“最近有效同类样本对称
+ 复制”边界与 floor 公式，严格反序（先列后行），因此任一中间层级的恢复
+ 结果等于对完整系数金字塔仅撤销最深 k 层后对应 LL 区域的内容，逐位一致。
+- 数据读取规则：撤销 k 层只读取第 `L - k + 1` 层工作区域内的系数；更浅
+ 各层的 LH/HL/HH 细节数据完全不被读取（甚至不做数值校验）。
+- `levels` 必须为 `0 <= k <= result.levels` 的整数（拒绝 bool 与浮点）。
 
 异常：
 
@@ -124,8 +142,10 @@ LL / LH（行高频）/ HL（列高频）/ HH 四个子带。多层时**只递�
 - 对输入的校验：拒绝 `bool`（尽管是 `int` 子类）、拒绝 `float`
   （`NaN`/`±Infinity` 给明确的 non-finite 报错，其他 float 报 TypeError）、
   拒绝非矩形/空矩阵/字符串伪装序列；`levels` 等整数参数同样拒绝 `bool`。
-- 逆变换只接受本库 `dwt2d` 产出的 `TransformResult`，并重新校验形状、
-  布局区间与每个系数，防止被篡改的元数据导致越界。
+- 逆变换只接受本库 `dwt2d` 产出的 `TransformResult`；在处理任何系数
+  之前，先把 `levels`/`layouts`/`subbands` 与该形状下的规范布局表逐项
+  比对，损坏的层级信息直接拒绝（`ValueError`），随后只校验并读取本次
+  恢复实际需要的系数区域。
 - 测试中的独立参考实现采用“交错下标 + 下标夹取”的另一套写法（见
   `tests/test_lifting.py` 顶部），**不调用被测核心**；手算小例与负数参考
   以常量形式写死。往返一致只作为补充测试。

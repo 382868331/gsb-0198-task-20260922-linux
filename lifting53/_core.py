@@ -343,6 +343,30 @@ def max_levels(height: int, width: int) -> int:
     return count
 
 
+def _build_layouts(h: int, w: int, levels: int) -> list[LevelLayout]:
+    """Canonical layout table for a (h, w) image decomposed into levels.
+
+    Level 1 works on the full image; each deeper level works on the previous
+    level's LL block (top-left anchored, ceil-halved per side).
+    """
+    layouts: list[LevelLayout] = []
+    r1, c1 = h, w
+    for level in range(1, levels + 1):
+        r0 = c0 = 0
+        lr = (r1 - r0 + 1) // 2
+        lc = (c1 - c0 + 1) // 2
+        bands = (
+            Subband("LL", level, (r0, r0 + lr), (c0, c0 + lc)),
+            Subband("LH", level, (r0, r0 + lr), (c0 + lc, c1)),
+            Subband("HL", level, (r0 + lr, r1), (c0, c0 + lc)),
+            Subband("HH", level, (r0 + lr, r1), (c0 + lc, c1)),
+        )
+        layouts.append(LevelLayout(level, (r0, r1), (c0, c1), lr, lc, bands))
+        r1 = r0 + lr
+        c1 = c0 + lc
+    return layouts
+
+
 def dwt2d(image: Sequence[Sequence[int]], levels: int = 1) -> TransformResult:
     """Forward 2D reversible 5/3 lifting decomposition.
 
@@ -369,25 +393,10 @@ def dwt2d(image: Sequence[Sequence[int]], levels: int = 1) -> TransformResult:
                 f"further levels would be identity on a 1x1 LL block"
             )
 
-    layouts: list[LevelLayout] = []
-    r0 = c0 = 0
-    r1, c1 = h, w
-    for level in range(1, levels + 1):
+    layouts = _build_layouts(h, w, levels)
+    for layout in layouts:
+        (r0, r1), (c0, c1) = layout.rows, layout.cols
         _fwd_block(a, r0, r1, c0, c1)
-        lr = (r1 - r0 + 1) // 2
-        lc = (c1 - c0 + 1) // 2
-        bands = (
-            Subband("LL", level, (r0, r0 + lr), (c0, c0 + lc)),
-            Subband("LH", level, (r0, r0 + lr), (c0 + lc, c1)),
-            Subband("HL", level, (r0 + lr, r1), (c0, c0 + lc)),
-            Subband("HH", level, (r0 + lr, r1), (c0 + lc, c1)),
-        )
-        layouts.append(
-            LevelLayout(level, (r0, r1), (c0, c1), lr, lc, bands)
-        )
-        # Multi-level: recurse into the LL region only.
-        r1 = r0 + lr
-        c1 = c0 + lc
 
     aggregate = tuple(
         b
@@ -410,35 +419,99 @@ def _validate_result(result: object) -> TransformResult:
             or not isinstance(w, int) or isinstance(w, bool)
             or h < 1 or w < 1 or h > MAX_SIDE or w > MAX_SIDE):
         raise ValueError(f"malformed shape in TransformResult: {result.shape}")
-    if len(result.layouts) != result.levels:
-        raise ValueError("malformed TransformResult: layouts/levels mismatch")
-    for layout in result.layouts:
-        r0, r1 = layout.rows
-        c0, c1 = layout.cols
-        if not (0 <= r0 < r1 <= h and 0 <= c0 < c1 <= w):
-            raise ValueError(
-                f"malformed layout at level {layout.level}: "
-                f"rows {layout.rows}, cols {layout.cols} outside shape"
-            )
+    if (not isinstance(result.levels, int) or isinstance(result.levels, bool)
+            or result.levels < 1):
+        raise ValueError(
+            f"malformed levels in TransformResult: {result.levels!r}"
+        )
+    # Level metadata must be exactly the canonical table for this shape;
+    # any corrupted layout is rejected before a single coefficient is read.
+    expected = tuple(_build_layouts(h, w, result.levels))
+    if tuple(result.layouts) != expected:
+        raise ValueError(
+            "malformed layouts in TransformResult: level metadata does not "
+            f"match the canonical layout for shape {h}x{w} with "
+            f"{result.levels} level(s)"
+        )
+    aggregate = tuple(
+        b
+        for layout in expected
+        for b in layout.bands
+        if not (b.name == "LL" and layout.level < result.levels)
+    )
+    if tuple(result.subbands) != aggregate:
+        raise ValueError(
+            "malformed subbands in TransformResult: does not match the "
+            "canonical subband list derived from the layouts"
+        )
     return result
 
 
-def idwt2d(result: TransformResult) -> tuple[tuple[int, ...], ...]:
-    """Exact inverse of :func:`dwt2d`, reconstructing the original image.
+def idwt2d(
+    result: TransformResult, levels: int | None = None
+) -> tuple[tuple[int, ...], ...]:
+    """Inverse of dwt2d, optionally stopping at a coarser resolution.
+
+    levels is the number of decomposition levels to undo, counting from
+    the deepest one; None (the default) undoes all of them and returns
+    the original full-resolution image bit-exactly.  Requesting fewer
+    levels returns the lower-resolution image held in the corresponding
+    LL block, without ever reading the finer detail subbands (LH/HL/HH
+    of the levels that are not undone).
+
+    Output shape rule: undoing k of L levels returns the image at
+    decomposition depth L - k, i.e. the shape obtained by ceil-halving
+    result.shape exactly L - k times (equivalently the working region
+    of level L - k + 1; for k = 0 the deepest LL block).  levels=0
+    performs no inverse step and simply extracts that block.
 
     Levels are undone in strict reverse order.  Pure integer arithmetic;
-    raises :class:`IntegerOverflowError` if a checked intermediate exceeds
-    the int63 limit.
+    raises IntegerOverflowError if a checked intermediate exceeds the
+    int63 limit.
     """
     result = _validate_result(result)
-    a = _validate_matrix(result.coefficients, "coefficients")
-    if (len(a), len(a[0])) != result.shape:
+    total = result.levels
+    if levels is None:
+        levels = total
+    if isinstance(levels, bool) or not isinstance(levels, int):
+        raise TypeError(
+            f"levels must be int or None, got {type(levels).__name__}"
+        )
+    if not 0 <= levels <= total:
         raise ValueError(
-            f"coefficient matrix shape {len(a)}x{len(a[0])} does not match "
-            f"recorded shape {result.shape[0]}x{result.shape[1]}"
+            f"levels={levels} outside [0, {total}] for a result with "
+            f"{total} decomposition level(s)"
         )
 
-    for layout in reversed(result.layouts):
+    # Undoing the k deepest levels only ever touches the working region of
+    # the shallowest undone level (the deepest LL block for k == 0);
+    # coefficients outside that region are not even validated.
+    h, w = result.shape
+    if levels == 0:
+        region_rows = result.layouts[-1].low_rows
+        region_cols = result.layouts[-1].low_cols
+    else:
+        region_rows = result.layouts[total - levels].rows[1]
+        region_cols = result.layouts[total - levels].cols[1]
+
+    coeffs = result.coefficients
+    if not _is_real_sequence(coeffs) or len(coeffs) != h:
+        raise ValueError(
+            f"coefficient matrix must have exactly {h} row(s) "
+            f"to match recorded shape {result.shape}"
+        )
+    rows = []
+    for r, row in enumerate(coeffs):
+        if not _is_real_sequence(row) or len(row) != w:
+            raise ValueError(
+                f"coefficients[{r}] must have length {w} "
+                f"to match recorded shape {result.shape}"
+            )
+        if r < region_rows:
+            rows.append(row[:region_cols])
+    a = _validate_matrix(rows, "coefficients")
+
+    for layout in reversed(result.layouts[total - levels:]):
         r0, r1 = layout.rows
         c0, c1 = layout.cols
         _inv_block(a, r0, r1, c0, c1)

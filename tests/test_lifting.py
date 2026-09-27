@@ -104,6 +104,33 @@ def ref_fwd2d(image, levels):
     return a
 
 
+def ref_partial_idwt2d(image, levels, undo):
+    """Spec-direct partial inverse: forward with the independent reference,
+    then undo only the deepest 'undo' levels and crop the coarse image."""
+    a = ref_fwd2d(image, levels)
+    h, w = len(a), len(a[0])
+    regions = []  # regions[j] = working region of level j+1
+    r1, c1 = h, w
+    for _ in range(levels):
+        regions.append((r1, c1))
+        r1 = (r1 + 1) // 2
+        c1 = (c1 + 1) // 2
+    for (r1, c1) in reversed(regions[levels - undo:]):
+        for c in range(c1):
+            col = [a[r][c] for r in range(r1)]
+            out = ref_inv1d(col)
+            for i, r in enumerate(range(r1)):
+                a[r][c] = out[i]
+        for r in range(r1):
+            a[r][:c1] = ref_inv1d(a[r][:c1])
+    if undo == 0:
+        out_h = (regions[-1][0] + 1) // 2
+        out_w = (regions[-1][1] + 1) // 2
+    else:
+        out_h, out_w = regions[levels - undo]
+    return [row[:out_w] for row in a[:out_h]]
+
+
 # ---------------------------------------------------------------------------
 # Deterministic sample generation
 # ---------------------------------------------------------------------------
@@ -485,6 +512,130 @@ class MutationAndAtomicity(unittest.TestCase):
             idwt2d([[1, 2], [3, 4]])  # type: ignore[arg-type]
 
     def test_idwt_shape_mismatch_detected(self):
+        res = dwt2d([[1, 2], [3, 4]])
+        tampered = TransformResult(
+            coefficients=((1, 2, 9), (3, 4, 9)),
+            shape=(2, 2),
+            levels=res.levels,
+            layouts=res.layouts,
+            subbands=res.subbands,
+        )
+        with self.assertRaises(ValueError):
+            idwt2d(tampered)
+
+
+# ---------------------------------------------------------------------------
+# Partial (coarse-resolution) reconstruction
+# ---------------------------------------------------------------------------
+
+class PartialReconstruction(unittest.TestCase):
+    def test_matches_independent_reference(self):
+        for h, w, lv in [(7, 5, 2), (8, 8, 3), (5, 5, 3), (1, 8, 3),
+                         (8, 1, 3), (9, 9, 2), (16, 13, 3), (3, 3, 1)]:
+            img = make_image(h, w, seed_offset=lv)
+            res = dwt2d(img, levels=lv)
+            for undo in range(0, lv + 1):
+                with self.subTest(shape=(h, w), levels=lv, undo=undo):
+                    got = [list(r) for r in idwt2d(res, levels=undo)]
+                    self.assertEqual(got, ref_partial_idwt2d(img, lv, undo))
+
+    def test_full_levels_default_is_bit_exact(self):
+        img = make_image(7, 5)
+        res = dwt2d(img, levels=2)
+        self.assertEqual(idwt2d(res), idwt2d(res, levels=2))
+        self.assertEqual(idwt2d(res), tuple(map(tuple, img)))
+
+    def test_output_shape_rule(self):
+        # 7x5, 2 levels: undo 2 -> 7x5, undo 1 -> 4x3, undo 0 -> 2x2.
+        res = dwt2d(make_image(7, 5), levels=2)
+        for undo, (eh, ew) in [(2, (7, 5)), (1, (4, 3)), (0, (2, 2))]:
+            with self.subTest(undo=undo):
+                out = idwt2d(res, levels=undo)
+                self.assertEqual((len(out), len(out[0])), (eh, ew))
+
+    def test_levels_zero_returns_deepest_ll(self):
+        res = dwt2d(make_image(8, 8), levels=3)
+        self.assertEqual(idwt2d(res, levels=0), res.extract("LL", 3))
+
+    def test_does_not_read_irrelevant_detail(self):
+        # Corrupt (with values that are not even valid integers) the detail
+        # subbands of the levels that are NOT undone; a partial inverse must
+        # never read them and must still succeed.
+        img = make_image(8, 8)
+        res = dwt2d(img, levels=2)
+        poisoned = [list(row) for row in res.coefficients]
+        for name in ("LH", "HL", "HH"):
+            b = res.band(name, 1)
+            for r in range(*b.rows):
+                for c in range(*b.cols):
+                    poisoned[r][c] = float("nan")
+        tampered = TransformResult(
+            coefficients=tuple(tuple(row) for row in poisoned),
+            shape=res.shape,
+            levels=res.levels,
+            layouts=res.layouts,
+            subbands=res.subbands,
+        )
+        got = idwt2d(tampered, levels=1)
+        self.assertEqual(got, idwt2d(res, levels=1))
+        # The full inverse, which genuinely needs those bands, must reject.
+        with self.assertRaises(ValueError):
+            idwt2d(tampered)
+
+    def test_levels_param_validation(self):
+        res = dwt2d(make_image(4, 4), levels=2)
+        with self.assertRaisesRegex(TypeError, "levels"):
+            idwt2d(res, levels=True)
+        with self.assertRaisesRegex(TypeError, "levels"):
+            idwt2d(res, levels=1.5)
+        with self.assertRaisesRegex(ValueError, "levels"):
+            idwt2d(res, levels=-1)
+        with self.assertRaisesRegex(ValueError, "levels"):
+            idwt2d(res, levels=3)
+
+
+# ---------------------------------------------------------------------------
+# Corrupted level metadata is rejected before processing
+# ---------------------------------------------------------------------------
+
+class CorruptedMetadata(unittest.TestCase):
+    def _tampered(self, **kw):
+        res = dwt2d(make_image(8, 8), levels=3)
+        base = dict(
+            coefficients=res.coefficients,
+            shape=res.shape,
+            levels=res.levels,
+            layouts=res.layouts,
+            subbands=res.subbands,
+        )
+        base.update(kw)
+        return TransformResult(**base)
+
+    def test_wrong_layout_region_rejected(self):
+        res = dwt2d(make_image(8, 8), levels=2)
+        bad = list(res.layouts)
+        lay = bad[1]
+        bad[1] = type(lay)(lay.level, (0, 3), lay.cols, lay.low_rows,
+                           lay.low_cols, lay.bands)
+        with self.assertRaisesRegex(ValueError, "layouts"):
+            idwt2d(self._tampered(layouts=tuple(bad)))
+
+    def test_truncated_layouts_rejected(self):
+        res = dwt2d(make_image(8, 8), levels=2)
+        with self.assertRaisesRegex(ValueError, "layouts"):
+            idwt2d(self._tampered(layouts=res.layouts[:1]))
+
+    def test_bad_levels_value_rejected(self):
+        with self.assertRaisesRegex(ValueError, "levels"):
+            idwt2d(self._tampered(levels=0))
+        with self.assertRaisesRegex(ValueError, "levels"):
+            idwt2d(self._tampered(levels=True))
+
+    def test_bad_subbands_rejected(self):
+        with self.assertRaisesRegex(ValueError, "subbands"):
+            idwt2d(self._tampered(subbands=()))
+
+    def test_shape_mismatch_rejected(self):
         res = dwt2d([[1, 2], [3, 4]])
         tampered = TransformResult(
             coefficients=((1, 2, 9), (3, 4, 9)),

@@ -3,7 +3,9 @@
 Public API
 ----------
 dwt2d(image, levels=1) -> TransformResult
-idwt2d(result) -> tuple of tuples (the reconstructed integer image)
+idwt2d(result, levels=None) -> tuple of tuples (the reconstructed integer
+    image; pass levels=k to undo only the deepest k levels and return the
+    coarser image at decomposition depth result.levels - k)
 dwt1d(signal) / idwt1d(coefficients)
 max_levels(height, width)
 Subband, LevelLayout, TransformResult

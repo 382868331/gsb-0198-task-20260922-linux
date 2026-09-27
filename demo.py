@@ -91,6 +91,20 @@ def main() -> None:
           f"max abs difference {max_abs_diff})")
     assert bit_exact, "round trip must be exact"
 
+    # Partial reconstruction: recover only the coarser resolutions without
+    # touching the finer detail subbands.
+    print("partial reconstruction (coarser resolutions only):")
+    for undo in (1, 0):
+        coarse = idwt2d(result, levels=undo)
+        depth = levels - undo
+        eh, ew = h, w
+        for _ in range(depth):
+            eh, ew = (eh + 1) // 2, (ew + 1) // 2
+        assert (len(coarse), len(coarse[0])) == (eh, ew)
+        print(f"  levels={undo}: depth-{depth} image, shape "
+              f"{len(coarse)}x{len(coarse[0])} (ceil-halved {depth}x)")
+        print_matrix(f"  coarse image at depth {depth}:", coarse)
+
     # Supplementary 1xN degenerate case: vertical detail bands are empty.
     one_row = [[3, -7, 2, 0, 5]]
     r1 = dwt2d(one_row, levels=2)

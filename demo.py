@@ -15,6 +15,9 @@ from __future__ import annotations
 from lifting53 import (
     INT63_MAX,
     IntegerOverflowError,
+    LevelLayout,
+    Subband,
+    TransformResult,
     dwt1d,
     dwt2d,
     idwt2d,
@@ -90,6 +93,44 @@ def main() -> None:
     print(f"bit-exact recovery: {bit_exact} (element count {h * w}, "
           f"max abs difference {max_abs_diff})")
     assert bit_exact, "round trip must be exact"
+
+    # Coarse-only recovery: the caller asks for each lower resolution
+    # directly.  Unrelated detail bands are never read.
+    print()
+    print("partial (coarse-only) reconstruction - no need to restore and "
+          "shrink:")
+    for k in range(1, levels + 1):
+        shape = result.shape_at_level(k)
+        coarse = idwt2d(result, resolution=k)
+        print(f"  resolution={k}: output shape {shape[0]}x{shape[1]} "
+              f"(ceil-halving of {h}x{w} {k} time(s))")
+        print_matrix(f"  level-{k} approximation:", coarse)
+    # The level-1 approximation expanded back must match the original bit
+    # for bit; coarser levels must match a full chain stopped at that point.
+    assert idwt2d(result, resolution=0) == tuple(map(tuple, image))
+
+    # Corrupted level information is rejected *before* any processing.
+    forged = LevelLayout(
+        level=2, rows=(0, 9), cols=(0, 3),
+        low_rows=5, low_cols=2,
+        bands=(
+            Subband("LL", 2, (0, 5), (0, 2)),
+            Subband("LH", 2, (0, 5), (2, 3)),
+            Subband("HL", 2, (5, 9), (0, 2)),
+            Subband("HH", 2, (5, 9), (2, 3)),
+        ),
+    )
+    corrupted = TransformResult(
+        result.coefficients, result.shape, result.levels,
+        (result.layouts[0], forged), result.subbands,
+    )
+    try:
+        idwt2d(corrupted, resolution=2)
+    except ValueError as exc:
+        print(f"corrupted level metadata rejected before processing: "
+              f"{type(exc).__name__}: {exc}")
+    else:
+        raise AssertionError("corrupted level metadata was not rejected")
 
     # Supplementary 1xN degenerate case: vertical detail bands are empty.
     one_row = [[3, -7, 2, 0, 5]]

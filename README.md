@@ -17,12 +17,13 @@
 # 必要测试（独立参考 + 手算常量 + 往返补充）
 python -m unittest discover -s tests -v
 
-# 固定输入演示（真实计算，含一个正常多层结果与两个实际触发的拒绝边界）
+# 固定输入演示（真实计算：多层逐位恢复 + 各粗层级部分恢复，另触发三个拒绝边界）
 python demo.py
 ```
 
 demo 为小规模固定输入（7×5 两层等），真实计算、无 `sleep`、无预录结果，
-正常机器上耗时远小于 1 秒（题面预算约 8 秒内）。
+包含逐位全分辨率恢复、每个粗层级的部分恢复（打印 `ceil` 半缩尺寸）以及
+损坏层级元数据的实际拒绝；正常机器上耗时远小于 1 秒（题面预算约 8 秒内）。
 
 ## 接口
 
@@ -33,7 +34,27 @@ result = dwt2d(image, levels=1)
 # image: Sequence[Sequence[int]]，矩形整数矩阵，不被修改
 # result: TransformResult
 reconstructed = idwt2d(result)          # 逐位恢复原矩阵
+coarse = idwt2d(result, resolution=k)   # 只恢复到第 k 层低分辨率近似
 ```
+
+`idwt2d` 新增**仅关键字参数** `resolution`（默认 `0`），用于直接恢复较低
+分辨率，无需先还原全部细节再缩小：
+
+- `resolution=0`：反解全部层，返回原图尺寸 `HxW`，逐位一致。
+- `resolution=k`（`1 <= k <= result.levels`）：只反解严格深于第 k 层的
+  层级（`k+1 … levels`），返回第 k 层 LL 近似；输出尺寸为
+  `(ceil(H/2**k), ceil(W/2**k))`，即每条边按 `ceil(s/2)` 连续收缩 k 次。
+  可在恢复前用 `result.shape_at_level(k)` 查询该尺寸（返回 `(height,
+  width)`，`level` 取 `1..levels`）。`resolution=levels` 时不做任何逆
+  步，结果就是最深层 LL 子带本身。
+- 奇数尺寸规则与正向完全一致：第 k 层 LL 高为 `ceil(H/2**k)`、宽为
+  `ceil(W/2**k)`（例如 7x5 → 4x3 → 2x2 → 1x1）；逆变换在各层使用与
+  正向相同的 5/3 半样本对称（同类样本夹取）边界，长度 1 方向恒等。
+- **不读无关数据**：请求第 k 层时，仅读取第 k 层 LL 块内的系数（所有
+  更深层都嵌套在其中）；第 1..k 层的 LH/HL/HH 细节以及该块外的任何
+  系数既不校验也不读取（其中可以是任意无关值，不影响第 k 层结果）。
+- `resolution` 为 bool、非整数或不在 `[0, levels]` 时，在任何计算前抛
+  `TypeError` / `ValueError`。
 
 公开数据结构（冻结 dataclass，不可变）：
 
@@ -46,6 +67,8 @@ reconstructed = idwt2d(result)          # 逐位恢复原矩阵
   - `subbands: tuple[Subband, ...]` — 每层 LH/HL/HH 加最深层 LL（中间层 LL
     是下一层工作区，可经 `layouts` 或 `band("LL", k)` 取得）。
   - `band(name, level)` / `extract(name, level)` — 取子带元数据 / 防御性拷贝。
+  - `shape_at_level(level)` — 恢复到该层时的输出尺寸 `(height, width)`
+    （`level` 为 1..levels，尺寸按 `ceil` 半缩规则给出）。
 - `LevelLayout`：`level`、`rows`、`cols`（半开区间）、`low_rows`、`low_cols`、
   `bands=(LL,LH,HL,HH)`。
 - `Subband`：`name`、`level`、`rows=(r0,r1)`、`cols=(c0,c1)`，半开区间；
@@ -91,7 +114,9 @@ reconstructed = idwt2d(result)          # 逐位恢复原矩阵
 二维：**先行后列**，对每个 1×2 子块（行、列）分别做一维变换，输出
 LL / LH（行高频）/ HL（列高频）/ HH 四个子带。多层时**只递归 LL 区域**，
 其余子带保持不动。逆变换**严格反序**：逐层从最深层开始，先列后行，
-每个一维步为前向的精确整数逆运算。
+每个一维步为前向的精确整数逆运算。部分恢复到第 k 层时只反解
+`k+1 … L` 层并返回第 k 层 LL，其尺寸为
+`(ceil(H/2**k), ceil(W/2**k))`，边界规则与完整逆变换完全相同。
 
 可逆性来自提升结构：逆步用同样的 floor 公式抵消（前向加的项逆向减、
 前向减的项逆向加），因此恢复误差恒为零。
@@ -125,7 +150,15 @@ LL / LH（行高频）/ HL（列高频）/ HH 四个子带。多层时**只递�
   （`NaN`/`±Infinity` 给明确的 non-finite 报错，其他 float 报 TypeError）、
   拒绝非矩形/空矩阵/字符串伪装序列；`levels` 等整数参数同样拒绝 `bool`。
 - 逆变换只接受本库 `dwt2d` 产出的 `TransformResult`，并重新校验形状、
-  布局区间与每个系数，防止被篡改的元数据导致越界。
+  但在读取任何系数或开始任何计算**之前**，先做完整的结构校验：`shape`/
+  `levels` 的类型与范围、布局层数一致、各层工作区落在矩阵内且严格嵌套
+  （深层工作区必须恰好是上一层 LL 块，首层覆盖整个矩阵）、
+  `low_rows/low_cols` 符合 `ceil` 半缩、四个子带必须以正确的半缩划分完整
+  分区（1×N / N×1 的零跨度细节带允许）、1×1 恒等区除 1×1 原图首层外不得
+  作为分解层、聚合 `subbands` 与各层布局一致。损坏的层级信息一律在此阶段
+  以可定位信息拒绝（`ValueError`），不会进入逆运算。结构校验通过后，只
+  对本次恢复实际会读取的矩形区域内的系数做数值校验（拒绝 bool/非整数/
+  NaN/Infinity/超 int63），其余区域不读取。
 - 测试中的独立参考实现采用“交错下标 + 下标夹取”的另一套写法（见
   `tests/test_lifting.py` 顶部），**不调用被测核心**；手算小例与负数参考
   以常量形式写死。往返一致只作为补充测试。

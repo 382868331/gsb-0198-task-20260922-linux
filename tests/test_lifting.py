@@ -17,6 +17,8 @@ from lifting53 import (
     INT63_MAX,
     MAX_SIDE,
     IntegerOverflowError,
+    LevelLayout,
+    Subband,
     TransformResult,
     dwt1d,
     dwt2d,
@@ -102,6 +104,39 @@ def ref_fwd2d(image, levels):
         r1 = r0 + (r1 - r0 + 1) // 2
         c1 = c0 + (c1 - c0 + 1) // 2
     return a
+
+
+def ref_inv_block(a, r0, r1, c0, c1):
+    """Spec-direct inverse 2D block (columns first, then rows)."""
+    for c in range(c0, c1):
+        col = [a[r][c] for r in range(r0, r1)]
+        out = ref_inv1d(col)
+        for i, r in enumerate(range(r0, r1)):
+            a[r][c] = out[i]
+    for r in range(r0, r1):
+        a[r][c0:c1] = ref_inv1d(a[r][c0:c1])
+
+
+def level_sizes(h, w, levels):
+    """Shapes of the LL blocks: index j is the shape after j levels."""
+    sizes = [(h, w)]
+    for _ in range(levels):
+        h, w = (h + 1) // 2, (w + 1) // 2
+        sizes.append((h, w))
+    return sizes
+
+
+def ref_partial_ll(image, levels, resolution):
+    """Independent level-``resolution`` approximation, never calling core."""
+    a = ref_fwd2d(image, levels)
+    h0, w0 = len(image), len(image[0])
+    sizes = level_sizes(h0, w0, levels)
+    # Undo only levels strictly deeper than the requested one.
+    for j in range(levels, resolution, -1):
+        wh, ww = sizes[j - 1]
+        ref_inv_block(a, 0, wh, 0, ww)
+    kh, kw = sizes[resolution]
+    return [row[:kw] for row in a[:kh]]
 
 
 # ---------------------------------------------------------------------------
@@ -500,6 +535,197 @@ class MutationAndAtomicity(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # Supplementary: exhaustive small-matrix exact round trips
 # ---------------------------------------------------------------------------
+
+class PartialReconstruction(unittest.TestCase):
+    CASES = [
+        (7, 5, 2), (8, 8, 3), (5, 5, 3), (1, 8, 3), (8, 1, 3),
+        (13, 1, 3), (33, 17, 4), (16, 13, 3), (9, 9, 4), (3, 3, 2),
+        (1, 1, 1),
+    ]
+
+    def test_partial_matches_independent_reference(self):
+        for h, w, lv in self.CASES:
+            for k in range(1, lv + 1):
+                with self.subTest(shape=(h, w), levels=lv, resolution=k):
+                    img = make_image(h, w, seed_offset=h * 3 + w + lv + k)
+                    res = dwt2d(img, levels=lv)
+                    got = idwt2d(res, resolution=k)
+                    exp = tuple(map(tuple, ref_partial_ll(img, lv, k)))
+                    self.assertEqual(got, exp)
+
+    def test_partial_shape_uses_ceil_halving_with_odd_sizes(self):
+        # 7 -> 4 -> 2 -> 1 ; 5 -> 3 -> 2 -> 1
+        res = dwt2d(make_image(7, 5), levels=3)
+        self.assertEqual(res.shape_at_level(1), (4, 3))
+        self.assertEqual(res.shape_at_level(2), (2, 2))
+        self.assertEqual(res.shape_at_level(3), (1, 1))
+        for k, expected in enumerate(((4, 3), (2, 2), (1, 1)), start=1):
+            coarse = idwt2d(res, resolution=k)
+            self.assertEqual((len(coarse), len(coarse[0])), expected)
+
+    def test_resolution_zero_equals_full_reconstruction(self):
+        img = make_image(31, 33)
+        res = dwt2d(img, levels=4)
+        self.assertEqual(idwt2d(res), idwt2d(res, resolution=0))
+        self.assertEqual(idwt2d(res, resolution=0), tuple(map(tuple, img)))
+
+    def test_coarsest_level_is_deepest_ll_verbatim(self):
+        # resolution == levels does no inverse steps: the returned image is
+        # exactly the deepest stored LL block.
+        img = make_image(7, 5)
+        res = dwt2d(img, levels=3)
+        self.assertEqual(idwt2d(res, resolution=3), res.extract("LL", 3))
+        self.assertEqual(res.extract("LL", 3), ((res.coefficients[0][0],),))
+
+    def test_coarse_result_ignores_unrelated_garbage(self):
+        # When only the coarsest resolution is requested, every coefficient
+        # outside that LL block (including all level-1 detail bands and
+        # level-2 LH/HL/HH) must be neither validated nor read.
+        img = make_image(7, 5)
+        res = dwt2d(img, levels=2)
+        rows = [list(row) for row in res.coefficients]
+        for r in range(7):
+            for c in range(2, 5):
+                rows[r][c] = "garbage"  # type: ignore[call-overload]
+        for r in range(2, 7):
+            rows[r][0] = float("inf")  # outside the 2x2 level-2 LL
+        poisoned = TransformResult(
+            coefficients=tuple(tuple(row) for row in rows),
+            shape=res.shape,
+            levels=res.levels,
+            layouts=res.layouts,
+            subbands=res.subbands,
+        )
+        self.assertEqual(
+            idwt2d(poisoned, resolution=2), idwt2d(res, resolution=2)
+        )
+        # Full reconstruction must still refuse the poisoned values.
+        with self.assertRaises((TypeError, ValueError)):
+            idwt2d(poisoned)
+
+    def test_corrupted_layout_outside_shape_rejected_before_processing(self):
+        res = dwt2d(make_image(4, 4), levels=2)
+        bad_layout = LevelLayout(
+            level=2,
+            rows=(0, 9), cols=(0, 2),  # extends beyond the 2x2 LL
+            low_rows=5, low_cols=1,
+            bands=(
+                Subband("LL", 2, (0, 5), (0, 1)),
+                Subband("LH", 2, (0, 5), (1, 2)),
+                Subband("HL", 2, (5, 9), (0, 1)),
+                Subband("HH", 2, (5, 9), (1, 2)),
+            ),
+        )
+        tampered = TransformResult(
+            res.coefficients, res.shape, res.levels,
+            (res.layouts[0], bad_layout), res.subbands,
+        )
+        with self.assertRaisesRegex(ValueError, "malformed layout"):
+            idwt2d(tampered)
+        with self.assertRaisesRegex(ValueError, "malformed layout"):
+            idwt2d(tampered, resolution=2)
+
+    def test_corrupted_nesting_rejected_before_processing(self):
+        res = dwt2d(make_image(8, 8), levels=3)
+        bad_layout = LevelLayout(
+            level=2, rows=(1, 5), cols=(0, 4),
+            low_rows=2, low_cols=2,
+            bands=(
+                Subband("LL", 2, (1, 3), (0, 2)),
+                Subband("LH", 2, (1, 3), (2, 4)),
+                Subband("HL", 2, (3, 5), (0, 2)),
+                Subband("HH", 2, (3, 5), (2, 4)),
+            ),
+        )
+        tampered = TransformResult(
+            res.coefficients, res.shape, res.levels,
+            (res.layouts[0], bad_layout, res.layouts[2]),
+            res.subbands,
+        )
+        with self.assertRaisesRegex(ValueError, "LL block"):
+            idwt2d(tampered, resolution=3)
+
+    def test_corrupted_band_partition_rejected_before_processing(self):
+        res = dwt2d(make_image(4, 4))
+        good = res.layouts[0]
+        bad_bands = (
+            Subband("LL", 1, (0, 3), (0, 2)),  # LL should be rows [0,2)
+            good.band("LH"), good.band("HL"), good.band("HH"),
+        )
+        bad_layout = LevelLayout(
+            level=1, rows=good.rows, cols=good.cols,
+            low_rows=good.low_rows, low_cols=good.low_cols,
+            bands=bad_bands,
+        )
+        tampered = TransformResult(
+            res.coefficients, res.shape, res.levels,
+            (bad_layout,), res.subbands,
+        )
+        with self.assertRaisesRegex(ValueError, "partition"):
+            idwt2d(tampered)
+
+    def test_levels_layout_count_mismatch_rejected(self):
+        res = dwt2d(make_image(8, 8), levels=3)
+        tampered = TransformResult(
+            res.coefficients, res.shape, 3,
+            (res.layouts[0], res.layouts[1]), res.subbands,
+        )
+        with self.assertRaisesRegex(ValueError, "layouts/levels"):
+            idwt2d(tampered)
+        with self.assertRaisesRegex(ValueError, "layouts/levels"):
+            idwt2d(tampered, resolution=1)
+
+    def test_identity_region_cannot_be_decomposed_again(self):
+        res = dwt2d(make_image(2, 2))  # max_levels == 1
+        second = LevelLayout(
+            level=2, rows=(0, 1), cols=(0, 1),
+            low_rows=1, low_cols=1,
+            bands=(
+                Subband("LL", 2, (0, 1), (0, 1)),
+                Subband("LH", 2, (0, 1), (1, 1)),
+                Subband("HL", 2, (1, 1), (0, 1)),
+                Subband("HH", 2, (1, 1), (1, 1)),
+            ),
+        )
+        fake_subbands = tuple(
+            b for b in res.subbands
+            if not (b.name == "LL" and b.level == 1)
+        ) + (
+            second.band("LH"), second.band("HL"), second.band("HH"),
+            second.band("LL"),
+        )
+        tampered = TransformResult(
+            res.coefficients, res.shape, 2,
+            (res.layouts[0], second),
+            fake_subbands,
+        )
+        with self.assertRaisesRegex(ValueError, "identity"):
+            idwt2d(tampered)
+
+    def test_bad_resolution_param(self):
+        res = dwt2d(make_image(8, 8), levels=3)
+        with self.assertRaisesRegex(ValueError, r"\[0, 3\]"):
+            idwt2d(res, resolution=4)
+        with self.assertRaisesRegex(ValueError, r"\[0, 3\]"):
+            idwt2d(res, resolution=-1)
+        with self.assertRaises(TypeError):
+            idwt2d(res, resolution=True)
+        with self.assertRaises(TypeError):
+            idwt2d(res, resolution=1.0)
+
+    def test_shape_at_level_bad_param(self):
+        res = dwt2d(make_image(8, 8), levels=3)
+        with self.assertRaises(ValueError):
+            res.shape_at_level(0)
+        with self.assertRaises(ValueError):
+            res.shape_at_level(4)
+        with self.assertRaises(TypeError):
+            res.shape_at_level(True)
+
+    def test_resolution_is_keyword_only(self):
+        with self.assertRaises(TypeError):
+            idwt2d(dwt2d(make_image(4, 4)), 1)  # type: ignore[misc]
+
 
 class ExactRoundTrip(unittest.TestCase):
     def test_all_shapes_and_levels(self):
